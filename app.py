@@ -19,26 +19,22 @@ COL_KNOWLEDGE = "knowledge_bank"
 COL_STYLE_REPORT = "style_report"
 
 EMBED_MODEL = "BAAI/bge-small-zh-v1.5"
-BM25_STORE = "./bm25_store.jsonl"
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
-LLM_MODEL = "cwchang/llama-3-taiwan-8b-instruct:latest"
-
-def check_ollama_ready() -> tuple[bool, str]:
+def check_ollama_ready() -> tuple[bool, str, list[str]]:
     try:
         r = requests.get("http://127.0.0.1:11434/api/tags", timeout=5)
         if r.status_code != 200:
-            return False, f"Ollama 服務回應狀態碼 {r.status_code}，請確認已啟動 ollama。"
+            return False, f"Ollama 服務回應狀態碼 {r.status_code}，請確認已啟動 ollama。", []
         tags = r.json()
         models = [m.get("name") for m in tags.get("models", []) if isinstance(m, dict)]
-        if LLM_MODEL not in models:
-            if not any((isinstance(n, str) and LLM_MODEL in n) for n in models):
-                return False, f"找不到模型：{LLM_MODEL}\n請先在終端機執行：ollama pull {LLM_MODEL}"
-        return True, "OK"
+        if not models:
+             return False, "Ollama 中未安裝任何模型。請先執行：ollama pull <model_name>", []
+        return True, "OK", models
     except requests.exceptions.ConnectionError:
-        return False, "無法連線到 Ollama（127.0.0.1:11434）。請確認 Ollama 已啟動。"
+        return False, "無法連線到 Ollama（127.0.0.1:11434）。請確認 Ollama 已啟動。", []
     except Exception as e:
-        return False, f"Ollama 檢查失敗：{e}"
+        return False, f"Ollama 檢查失敗：{e}", []
 
 RERANK_MODEL = "BAAI/bge-reranker-base"
 
@@ -129,27 +125,41 @@ def bm25_search(collection_name: str, query: str, k: int) -> List[Tuple[str, str
     return out
 
 # ---- LLM helpers ----
-def ollama_generate(prompt: str, temperature: float = 0.3, max_tokens: int = None) -> str:
+def ollama_generate(prompt: str, model_name: str, temperature: float = 0.3, max_tokens: int = None) -> str:
     options = {"temperature": temperature}
     if max_tokens:
         options["num_predict"] = max_tokens
         
-    r = requests.post(
-        OLLAMA_URL,
-        json={"model": LLM_MODEL, "prompt": prompt, "stream": False, "options": options},
-        timeout=900,
-    )
-    r.raise_for_status()
-    return r.json()["response"]
+    response_text = ""
+    try:
+        # 使用 stream=True 避免大模型生成過久導致單次連線 ReadTimeout
+        with requests.post(
+            OLLAMA_URL,
+            json={"model": model_name, "prompt": prompt, "stream": True, "options": options},
+            timeout=900,
+            stream=True
+        ) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if line:
+                    data = json.loads(line)
+                    response_text += data.get("response", "")
+                    if data.get("done"):
+                        break
+        return response_text
+    except requests.exceptions.ReadTimeout:
+        raise Exception(f"模型 ({model_name}) 回應超時。請檢查 Ollama 是否正在跑大模型導致速度太慢（建議使用 7B 或 14B 版本），或調整硬體資源。")
+    except Exception as e:
+        raise Exception(f"Ollama 產生失敗：{e}")
 
-def hyde_query(topic: str) -> str:
+def hyde_query(topic: str, model_name: str) -> str:
     prompt = f"""你是企業 ESG 與永續發展報告的資深顧問。請根據主題生成一段「假想的標準答案摘要」（200~260字），
 用來幫助檢索相關資料。要求：
 - 只寫摘要，不要條列，不要引用來源
 - 內容要涵蓋 ESG 常見相關構面：例如 環境(E)的管理與排放目標、社會(S)的人權與勞工權益、治理(G)的風險管控等
 主題：{topic}
 """
-    return ollama_generate(prompt, temperature=0.4).strip()
+    return ollama_generate(prompt, model_name=model_name, temperature=0.4).strip()
 
 # ---- Reranker ----
 @st.cache_resource
@@ -279,28 +289,37 @@ def build_generate_prompt_from_checked(checked_json: dict, topic: str, style_sni
 """
 
     return f"""# Role
-你是一位資深 ESG 與永續發展顧問，文風「穩健、專業、具洞察力」。你的核心任務是將【已查核事實清單】重組為一篇邏輯嚴密、能幫助決策者與利害關係人了解該議題的專業報告。
+你是一位專精於「ESG 永續敘事」的頂級顧問與策略編輯。你的核心任務是將【已查核事實清單】轉化為一篇具備國際永續報告書水準、語氣專業且富有願景感的深度分析報告。
 
 # Thinking Process (Internal Logic)
-1. **主題類型判定**：首先分析事實屬於「永續治理(G)」、「環境(E)」還是「社會(S)」。
-2. **語意自適應標題**：針對特定永續主題設定適當的標題。
-3. **數據嚴謹性**：所有具體指標（如減碳量、用電百分比、年分、專案金額）必須 100% 來自清單，不得外推。
+1.  **敘事轉化**：不只是條列事實，而是將數據融入敘事中，強調企業對環境、社會及治理的正面影響與承諾。
+2.  **專業遣詞**：使用符合國際永續趨勢（如 GRI, SASB, TCFD, CSRD）的專業術語，但保持文筆生動流暢，具備高度可讀性。
+3.  **數據精準**：嚴格遵守清單數據，不得任意推導，但可針對指標的重要性進行質化詮釋。
+4.  使用繁體中文（台灣用語）做為輸出語言 #zh-tw
 
-# Output Format & Structure
-1) TITLE: <20字內，針對主題性質生成，專業且有說服力>
+# Output Format & Structure (ESG Report Style)
+1) TITLE: <20字內，具備願景、宏觀且吸引利害關係人的標題>
+
 2) Markdown 正文：
 
-## 執行摘要 (Executive Summary)
-（140–220字：描述該議題的背景、重要性，以及現階段發展情形。）
+## 執行摘要：邁向永續的關鍵進程 (Executive Summary)
+（150–250字：以宏觀視角描述該議題對公司競爭力與永續轉型的重要性，並摘要現階段最關鍵的績效亮點。）
 
-## 永續目標與推動機制
-（請包含 4–6 個小標題 ###。內容應涵蓋：策略框架、衡量指標指標與達成進度。若有不同年度或項目的數據請整理清晰。）
+## 年度績效亮點 (Annual Performance Highlights)
+（請用 3–4 個條列式描述，強調最具代表性的量化指標或指標性成就。例如：減碳達成率、能源轉型進度、社會影響力數據等。）
 
-## 挑戰與風險評估
-（條列式描述：推動過程中的挑戰、政策限制，或者清單中提到的證據侷限性與潛在風險。）
+## 永續轉型支柱 (Strategic Pillars)
+（請針對事實內容，彈性選擇 3–4 個主題小標題 ###，並確保涵蓋 E, S, G 相關構面：）
+- **環境永續 (Environmental)**：如氣候戰略、循環經濟、資源管理、碳足跡減量。
+- **社會共融 (Social)**：如人才培育、多元平等(DEI)、供應鏈管理、社會連結。
+- **治理透明 (Governance)**：如風險管理、合規體系、資訊安全、經營韌性。
+（內容應深入分析策略框架、具體行動與達成進度。若有年度數據請以易讀方式整理敘述。）
 
-## 未來展望與行動建議
-（條列式描述：具體可操作的下一步，例如：短中長期目標、增強監管、或需擴大投資的領域。）
+## 應對挑戰與韌性管理 (Challenges & Resilience)
+（條列式描述：推動過程中的實務困難、外部風險（如法規變動、極端氣候）、以及企業採取的緩釋措施。）
+
+## 未來承諾與行動藍圖 (Future Commitments & Roadmap)
+（條列式描述：具體可操作的下一步，包括短中長期目標設定、預計投入的資源、或需擴大影響力的前瞻領域。）
 {style_instruction}
 
 主題：{topic}
@@ -308,6 +327,7 @@ def build_generate_prompt_from_checked(checked_json: dict, topic: str, style_sni
 【已查核事實清單】
 {fact_block}
 """
+
 
 def parse_title_and_body(text: str, fallback_title: str):
     m = TITLE_RE.search(text)
@@ -379,11 +399,10 @@ def manuscript_to_docx_bytes(title: str, manuscript: str) -> bytes:
     return buf.getvalue()
 
 
-# ---- UI ----
 st.set_page_config(page_title="ESG Report RAG", layout="wide")
 st.title("🌱 ESG 報告書智慧分析 RAG")
 
-ollama_ok, ollama_msg = check_ollama_ready()
+ollama_ok, ollama_msg, available_models = check_ollama_ready()
 if not ollama_ok:
     st.error(ollama_msg)
     st.stop()
@@ -391,13 +410,25 @@ if not ollama_ok:
 col_esg_reports, col_knowledge, col_style = get_collections()
 
 with st.sidebar:
-    st.header("檢索與品質設定")
+    st.header("模型與檢索設定")
+    
+    # Model Selection
+    default_model_target = "kenneth85/llama-3-taiwan:latest"
+    default_idx = 0
+    if default_model_target in available_models:
+        default_idx = available_models.index(default_model_target)
+    
+    selected_llm = st.selectbox("選擇 Ollama 模型", available_models, index=default_idx)
+    st.caption("💡 **硬體提示**：NVIDIA 8G 顯卡建議使用 **7B** 或 **14B** 模型。若使用 32B 以上模型速度會大幅下降。")
+    st.divider()
+
+    st.subheader("檢索品質設定")
     use_style = st.checkbox("使用 Style (樣本)", value=True)
     use_knowledge = st.checkbox("使用 Knowledge Bank (法規/框架定錨)", value=True)
     
     use_hyde = st.checkbox("啟用 HyDE (提升召回)", value=True)
     use_bm25 = st.checkbox("啟用 BM25 (關鍵字召回)", value=True)
-    if use_bm25 and (not os.path.exists(BM25_STORE)):
+    if use_bm25 and (not os.path.exists(os.path.join(BM25_DIR, f"{COL_ESG_REPORTS}.jsonl"))):
         st.warning("找不到 BM25 store。請先執行：python ingest.py --mode all")
     use_rerank = st.checkbox("啟用 Reranker (重排序)", value=True)
 
@@ -435,8 +466,8 @@ with a:
         q = topic.strip()
         hyde_txt = ""
         if use_hyde:
-            with st.spinner("HyDE 生成中…"):
-                hyde_txt = hyde_query(q)
+            with st.spinner(f"HyDE 生成中 ({selected_llm})…"):
+                hyde_txt = hyde_query(q, selected_llm)
             st.session_state.hyde = hyde_txt
 
         vec_hits = vec_search(col_esg_reports, q, vec_k)
@@ -482,8 +513,8 @@ with a:
         st.subheader("🧾 Stage 1：抽取事實清單")
         fact_prompt = build_fact_prompt(final_hits, q)
         try:
-            with st.spinner("本機抽取 Facts 中…"):
-                st.session_state.facts = ollama_generate(fact_prompt, temperature=0.2)
+            with st.spinner(f"本機抽取 Facts 中 ({selected_llm})…"):
+                st.session_state.facts = ollama_generate(fact_prompt, model_name=selected_llm, temperature=0.2)
         except Exception as e:
             st.error(f"事實抽取失敗：{e}")
 
@@ -509,8 +540,8 @@ with c:
                         
             gen_prompt = build_generate_prompt_from_checked(checked_json, topic.strip(), style_snippets)
             try:
-                with st.spinner("本機生成報告中…"):
-                    draft = ollama_generate(gen_prompt, temperature=0.35)
+                with st.spinner(f"本機生成報告中 ({selected_llm})…"):
+                    draft = ollama_generate(gen_prompt, model_name=selected_llm, temperature=0.35)
             except Exception as e:
                 st.error(f"生成失敗：{e}")
                 st.stop()
