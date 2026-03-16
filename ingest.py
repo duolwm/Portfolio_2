@@ -55,19 +55,31 @@ def ingest_folder(client, collection_name: str, folder: Path, bm25_path: Path):
             if p.suffix.lower() not in [".pdf", ".txt", ".md"]:
                 continue
 
-            doc_text, extra_meta = load_any_file_with_meta(p)
-            chunks = make_chunks(doc_text, source=p.name, path=str(p))
+            try:
+                doc_text, extra_meta = load_any_file_with_meta(p)
+                if not doc_text:
+                    continue
+                chunks = make_chunks(doc_text, source=p.name, path=str(p))
+            except Exception as e:
+                print(f"ERROR processing {p.name}: {e}")
+                continue
 
+            import hashlib
             ids, docs, metas = [], [], []
             for c in chunks:
-                cid = f"{c.meta['source']}::{c.meta['section_path']}::{c.meta['part']}"
-                ids.append(cid)
-                docs.append(c.text)
                 meta = dict(c.meta)
                 for k, v in (extra_meta or {}).items():
                     if v is None:
                         continue
                     meta[k] = v
+                
+                # Create a unique hash ID based on source, section, part, and text content
+                # This prevents DuplicateIDError even with garbled metadata
+                input_str = f"{c.meta['source']}_{c.meta['section_path']}_{c.meta['part']}_{c.text}"
+                cid = hashlib.sha256(input_str.encode("utf-8", errors="ignore")).hexdigest()[:32]
+                
+                ids.append(cid)
+                docs.append(c.text)
                 metas.append(meta)
 
                 bm25_f.write(json.dumps({"id": cid, "text": c.text, "meta": meta}, ensure_ascii=False) + "\n")
@@ -75,11 +87,25 @@ def ingest_folder(client, collection_name: str, folder: Path, bm25_path: Path):
 
             if docs:
                 metas = [sanitize_metadata(m) for m in metas]
-                col.add(ids=ids, documents=docs, metadatas=metas)
-                total += len(docs)
-                print(f"✅ {collection_name}: {p.name} -> {len(docs)} chunks")
-
-    print(f"🎉 {collection_name} 索引完成：chunks={total} | BM25 rows={bm25_rows}")
+                
+                # Deduplicate within the batch to be extra safe
+                unique_ids = []
+                unique_docs = []
+                unique_metas = []
+                seen_ids = set()
+                for i, cid in enumerate(ids):
+                    if cid not in seen_ids:
+                        seen_ids.add(cid)
+                        unique_ids.append(cid)
+                        unique_docs.append(docs[i])
+                        unique_metas.append(metas[i])
+                
+                # Use upsert to handle IDs that might already exist in the DB
+                col.upsert(ids=unique_ids, documents=unique_docs, metadatas=unique_metas)
+                total += len(unique_docs)
+                print(f"[OK] {collection_name}: {p.name} -> {len(unique_docs)} chunks")
+        
+    print(f"[DONE] {collection_name} 索引完成：chunks={total} | BM25 rows={bm25_rows}")
     print(f"BM25 store：{bm25_path}\n")
 
 
